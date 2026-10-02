@@ -1,0 +1,1273 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math' show Random;
+import 'dart:typed_data' show Int64List;
+import 'dart:ui' show Color, DartPluginRegistrant;
+import 'package:flutter/foundation.dart' show debugPrint;
+// flet 0.86+ exports its own protocol `Message`, colliding with
+// flutter_local_notifications' messaging-style `Message` used below.
+import 'package:flet/flet.dart' hide Message;
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:timezone/timezone.dart' as tz;
+import 'package:timezone/data/latest_all.dart' as tz_data;
+
+const String _backgroundResponsesKey =
+    'flet_android_notifications_background_responses';
+const String _backgroundResponsePrefix = '${_backgroundResponsesKey}_';
+
+Map<String, dynamic> _notificationResponseToMap(NotificationResponse response) => {
+      "notification_id": response.id,
+      "payload": response.payload ?? "",
+      "action_id": response.actionId ?? "",
+      "input": response.input ?? "",
+      "response_type": response.notificationResponseType.name,
+    };
+
+String _notificationResponseToJson(NotificationResponse response) =>
+    jsonEncode(_notificationResponseToMap(response));
+
+@pragma('vm:entry-point')
+Future<void> notificationTapBackground(NotificationResponse response) async {
+  DartPluginRegistrant.ensureInitialized();
+  final prefs = await SharedPreferences.getInstance();
+  final random = Random.secure();
+  final nonce = base64UrlEncode(List.generate(16, (_) => random.nextInt(256)));
+  // Separate keys avoid read-modify-write races across background isolates.
+  final key = '$_backgroundResponsePrefix${DateTime.now().microsecondsSinceEpoch}_$nonce';
+  if (!await prefs.setString(key, _notificationResponseToJson(response))) {
+    throw StateError('Could not persist notification response');
+  }
+}
+
+class NotificationsService extends FletService {
+  NotificationsService({required super.control});
+
+  final FlutterLocalNotificationsPlugin _plugin =
+      FlutterLocalNotificationsPlugin();
+  Completer<bool>? _initCompleter;
+  DateTime? _lastShowTime;
+  bool _launchResponseReplayed = false;
+
+  @override
+  void init() {
+    super.init();
+    control.addInvokeMethodListener(_onMethod);
+    _ensureInitialized();
+  }
+
+  @override
+  void dispose() {
+    control.removeInvokeMethodListener(_onMethod);
+    super.dispose();
+  }
+
+  Future<bool> _ensureInitialized() async {
+    if (_initCompleter != null) {
+      return _initCompleter!.future;
+    }
+    final completer = Completer<bool>();
+    _initCompleter = completer;
+    var initialized = false;
+
+    try {
+      tz_data.initializeTimeZones();
+
+      const androidSettings =
+          AndroidInitializationSettings('@mipmap/ic_launcher');
+      const initSettings = InitializationSettings(android: androidSettings);
+
+      final result = await _plugin.initialize(
+        settings: initSettings,
+        onDidReceiveNotificationResponse: (response) {
+          _emitNotificationResponse(response);
+        },
+        onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
+      );
+      initialized = result ?? false;
+      if (initialized) {
+        // Replay failure must not invalidate successful plugin initialization.
+        for (final replay in [
+          _replayLaunchNotificationResponse,
+          _replayBackgroundNotificationResponses,
+        ]) {
+          try {
+            await replay();
+          } catch (e) {
+            debugPrint('Notification response replay failed: $e');
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Notification initialization failed: $e');
+    } finally {
+      if (!initialized) _initCompleter = null;
+      completer.complete(initialized);
+    }
+
+    return completer.future;
+  }
+
+  void _emitNotificationResponse(NotificationResponse response,
+      {bool skipDebounce = false}) {
+    final hasAction = response.actionId != null && response.actionId!.isNotEmpty;
+    // Debounce only body taps. Some Android skins can fire a body tap
+    // immediately after show, while action button presses are intentional.
+    if (!skipDebounce &&
+        !hasAction &&
+        _lastShowTime != null &&
+        DateTime.now().difference(_lastShowTime!).inMilliseconds < 300) {
+      return;
+    }
+    control.triggerEvent("notification_tap", _notificationResponseToJson(response));
+  }
+
+  Future<void> _replayLaunchNotificationResponse() async {
+    if (_launchResponseReplayed) return;
+    _launchResponseReplayed = true;
+
+    final details = await _plugin.getNotificationAppLaunchDetails();
+    if (details == null || !details.didNotificationLaunchApp) return;
+
+    final response = details.notificationResponse;
+    if (response != null) {
+      _emitNotificationResponse(response, skipDebounce: true);
+    }
+  }
+
+  Future<void> _replayBackgroundNotificationResponses() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.reload();
+    // Drain pre-0.11.1 entries too; new callbacks never modify this list.
+    final legacy = prefs.getStringList(_backgroundResponsesKey) ?? <String>[];
+    for (var i = 0; i < legacy.length; i++) {
+      control.triggerEvent("notification_tap", legacy[i]);
+      final saved = i == legacy.length - 1
+          ? await prefs.remove(_backgroundResponsesKey)
+          : await prefs.setStringList(_backgroundResponsesKey, legacy.sublist(i + 1));
+      if (!saved) throw StateError('Could not acknowledge notification response');
+    }
+    final keys = prefs.getKeys().where((key) => key.startsWith(_backgroundResponsePrefix)).toList()..sort();
+    for (final key in keys) {
+      final responseJson = prefs.getString(key);
+      if (responseJson == null) continue;
+      control.triggerEvent("notification_tap", responseJson);
+      if (!await prefs.remove(key)) {
+        throw StateError('Could not acknowledge notification response');
+      }
+    }
+  }
+
+  Importance _parseImportance(String value) {
+    switch (value) {
+      case "none":
+        return Importance.none;
+      case "min":
+        return Importance.min;
+      case "low":
+        return Importance.low;
+      case "default":
+        return Importance.defaultImportance;
+      case "high":
+        return Importance.high;
+      case "max":
+        return Importance.max;
+      default:
+        throw ArgumentError('invalid importance: $value');
+    }
+  }
+
+  Priority _priorityFromImportance(Importance importance) {
+    switch (importance) {
+      case Importance.none:
+      case Importance.min:
+        return Priority.min;
+      case Importance.low:
+        return Priority.low;
+      case Importance.defaultImportance:
+        return Priority.defaultPriority;
+      case Importance.high:
+        return Priority.high;
+      case Importance.max:
+        return Priority.max;
+      default:
+        return Priority.defaultPriority;
+    }
+  }
+
+  AndroidScheduleMode _parseAndroidScheduleMode(String value) {
+    switch (value) {
+      case "alarm_clock":
+        return AndroidScheduleMode.alarmClock;
+      case "exact":
+        return AndroidScheduleMode.exact;
+      case "exact_allow_while_idle":
+        return AndroidScheduleMode.exactAllowWhileIdle;
+      case "inexact":
+        return AndroidScheduleMode.inexact;
+      case "inexact_allow_while_idle":
+        return AndroidScheduleMode.inexactAllowWhileIdle;
+      default:
+        throw ArgumentError('invalid schedule_mode: $value');
+    }
+  }
+
+  DateTimeComponents? _parseDateTimeComponents(String? value) {
+    if (value == null) return null;
+    switch (value) {
+      case "time":
+        return DateTimeComponents.time;
+      case "day_of_week_and_time":
+        return DateTimeComponents.dayOfWeekAndTime;
+      case "day_of_month_and_time":
+        return DateTimeComponents.dayOfMonthAndTime;
+      case "date_and_time":
+        return DateTimeComponents.dateAndTime;
+      default:
+        throw ArgumentError('invalid match_date_time_components: $value');
+    }
+  }
+
+  GroupAlertBehavior _parseGroupAlertBehavior(String value) {
+    switch (value) {
+      case "all":
+        return GroupAlertBehavior.all;
+      case "summary":
+        return GroupAlertBehavior.summary;
+      case "children":
+        return GroupAlertBehavior.children;
+      default:
+        throw ArgumentError('invalid group_alert_behavior: $value');
+    }
+  }
+
+  Color? _parseColor(String? hex) {
+    if (hex == null) return null;
+    hex = hex.replaceFirst('#', '');
+    if (hex.length == 6) hex = 'FF$hex';
+    return Color(int.parse(hex, radix: 16));
+  }
+
+  AndroidBitmap<Object>? _parseActionIcon(String? value, String type) {
+    if (value == null) return null;
+    if (type == "file_path") {
+      return FilePathAndroidBitmap(value);
+    }
+    return DrawableResourceAndroidBitmap(value);
+  }
+
+  AndroidBitmap<Object>? _parseLargeIcon(String? value, String type) {
+    if (value == null) return null;
+    if (type == "file_path") {
+      return FilePathAndroidBitmap(value);
+    }
+    return DrawableResourceAndroidBitmap(value);
+  }
+
+  NotificationVisibility? _parseVisibility(String? value) {
+    if (value == null) return null;
+    switch (value) {
+      case "public":
+        return NotificationVisibility.public;
+      case "private":
+        return NotificationVisibility.private;
+      case "secret":
+        return NotificationVisibility.secret;
+      default:
+        throw ArgumentError('invalid visibility: $value');
+    }
+  }
+
+  AndroidNotificationCategory? _parseCategory(String? value) {
+    if (value == null) return null;
+    switch (value) {
+      case "alarm":
+        return AndroidNotificationCategory.alarm;
+      case "call":
+        return AndroidNotificationCategory.call;
+      case "email":
+        return AndroidNotificationCategory.email;
+      case "error":
+        return AndroidNotificationCategory.error;
+      case "event":
+        return AndroidNotificationCategory.event;
+      case "message":
+        return AndroidNotificationCategory.message;
+      case "navigation":
+        return AndroidNotificationCategory.navigation;
+      case "progress":
+        return AndroidNotificationCategory.progress;
+      case "promo":
+        return AndroidNotificationCategory.promo;
+      case "recommendation":
+        return AndroidNotificationCategory.recommendation;
+      case "reminder":
+        return AndroidNotificationCategory.reminder;
+      case "service":
+        return AndroidNotificationCategory.service;
+      case "social":
+        return AndroidNotificationCategory.social;
+      case "status":
+        return AndroidNotificationCategory.status;
+      case "stopwatch":
+        return AndroidNotificationCategory.stopwatch;
+      case "transport":
+        return AndroidNotificationCategory.transport;
+      case "workout":
+        return AndroidNotificationCategory.workout;
+      default:
+        throw ArgumentError('invalid category: $value');
+    }
+  }
+
+  SemanticAction _parseSemanticAction(String value) {
+    switch (value) {
+      case "none":
+        return SemanticAction.none;
+      case "reply":
+        return SemanticAction.reply;
+      case "mark_as_read":
+        return SemanticAction.markAsRead;
+      case "mark_as_unread":
+        return SemanticAction.markAsUnread;
+      case "delete":
+        return SemanticAction.delete;
+      case "archive":
+        return SemanticAction.archive;
+      case "mute":
+        return SemanticAction.mute;
+      case "unmute":
+        return SemanticAction.unmute;
+      case "thumbs_up":
+        return SemanticAction.thumbsUp;
+      case "thumbs_down":
+        return SemanticAction.thumbsDown;
+      case "call":
+        return SemanticAction.call;
+      default:
+        throw ArgumentError('invalid semantic_action: $value');
+    }
+  }
+
+  Person _parsePerson(Map<String, dynamic> data) {
+    AndroidIcon<Object>? icon;
+    final iconValue = data["icon"] as String?;
+    if (iconValue != null) {
+      switch (data["icon_type"] as String? ?? "drawable_resource") {
+        case "file_path":
+          icon = BitmapFilePathAndroidIcon(iconValue);
+          break;
+        case "content_uri":
+          icon = ContentUriAndroidIcon(iconValue);
+          break;
+        default:
+          icon = DrawableResourceAndroidIcon(iconValue);
+      }
+    }
+    return Person(
+      name: data["name"] as String?,
+      key: data["key"] as String?,
+      bot: data["bot"] as bool? ?? false,
+      important: data["important"] as bool? ?? false,
+      uri: data["uri"] as String?,
+      icon: icon,
+    );
+  }
+
+  StyleInformation? _parseStyleInformation(Map<String, dynamic>? style) {
+    if (style == null) return null;
+    switch (style["type"]) {
+      case "big_text":
+        return BigTextStyleInformation(
+          style["big_text"] as String,
+          contentTitle: style["content_title"] as String?,
+          summaryText: style["summary_text"] as String?,
+        );
+      case "big_picture":
+        final bitmapType = style["bitmap_type"] as String;
+        final bitmapValue = style["bitmap_value"] as String;
+        AndroidBitmap<Object> bitmap;
+        if (bitmapType == "file_path") {
+          bitmap = FilePathAndroidBitmap(bitmapValue);
+        } else {
+          bitmap = DrawableResourceAndroidBitmap(bitmapValue);
+        }
+        AndroidBitmap<Object>? largeIcon;
+        if (style["large_icon_type"] != null) {
+          final iconType = style["large_icon_type"] as String;
+          final iconValue = style["large_icon_value"] as String;
+          if (iconType == "file_path") {
+            largeIcon = FilePathAndroidBitmap(iconValue);
+          } else {
+            largeIcon = DrawableResourceAndroidBitmap(iconValue);
+          }
+        }
+        return BigPictureStyleInformation(
+          bitmap,
+          contentTitle: style["content_title"] as String?,
+          summaryText: style["summary_text"] as String?,
+          largeIcon: largeIcon,
+          hideExpandedLargeIcon: style["hide_expanded_large_icon"] as bool? ?? false,
+        );
+      case "inbox":
+        final lines = (style["lines"] as List<dynamic>).cast<String>();
+        return InboxStyleInformation(
+          lines,
+          contentTitle: style["content_title"] as String?,
+          summaryText: style["summary_text"] as String?,
+        );
+      case "messaging":
+        final messages = ((style["messages"] as List<dynamic>?) ?? [])
+            .map((message) {
+              final m = Map<String, dynamic>.from(message as Map);
+              return Message(
+                m["text"] as String,
+                DateTime.fromMillisecondsSinceEpoch(m["timestamp_ms"] as int),
+                m["person"] != null
+                    ? _parsePerson(Map<String, dynamic>.from(m["person"] as Map))
+                    : null,
+              );
+            })
+            .toList();
+        return MessagingStyleInformation(
+          _parsePerson(Map<String, dynamic>.from(style["person"] as Map)),
+          conversationTitle: style["conversation_title"] as String?,
+          groupConversation: style["group_conversation"] as bool? ?? false,
+          messages: messages,
+        );
+      default:
+        throw ArgumentError('invalid style type: ${style["type"]}');
+    }
+  }
+
+  RepeatInterval _parseRepeatInterval(String value) {
+    switch (value) {
+      case "every_minute":
+        return RepeatInterval.everyMinute;
+      case "hourly":
+        return RepeatInterval.hourly;
+      case "daily":
+        return RepeatInterval.daily;
+      case "weekly":
+        return RepeatInterval.weekly;
+      default:
+        throw ArgumentError('invalid repeat_interval: $value');
+    }
+  }
+
+  AndroidServiceStartType _parseServiceStartType(String value) {
+    switch (value) {
+      case "start_sticky":
+        return AndroidServiceStartType.startSticky;
+      case "start_not_sticky":
+        return AndroidServiceStartType.startNotSticky;
+      case "start_sticky_compatibility":
+        return AndroidServiceStartType.startStickyCompatibility;
+      case "start_redeliver_intent":
+        return AndroidServiceStartType.startRedeliverIntent;
+      default:
+        throw ArgumentError('invalid start_type: $value');
+    }
+  }
+
+  Set<AndroidServiceForegroundType>? _parseForegroundServiceTypes(
+      List<dynamic>? values) {
+    if (values == null || values.isEmpty) return null;
+    final map = <String, AndroidServiceForegroundType>{
+      "data_sync": AndroidServiceForegroundType.foregroundServiceTypeDataSync,
+      "media_playback": AndroidServiceForegroundType.foregroundServiceTypeMediaPlayback,
+      "phone_call": AndroidServiceForegroundType.foregroundServiceTypePhoneCall,
+      "location": AndroidServiceForegroundType.foregroundServiceTypeLocation,
+      "connected_device": AndroidServiceForegroundType.foregroundServiceTypeConnectedDevice,
+      "media_projection": AndroidServiceForegroundType.foregroundServiceTypeMediaProjection,
+      "camera": AndroidServiceForegroundType.foregroundServiceTypeCamera,
+      "microphone": AndroidServiceForegroundType.foregroundServiceTypeMicrophone,
+      "health": AndroidServiceForegroundType.foregroundServiceTypeHealth,
+      "remote_messaging": AndroidServiceForegroundType.foregroundServiceTypeRemoteMessaging,
+      "system_exempted": AndroidServiceForegroundType.foregroundServiceTypeSystemExempted,
+      "short_service": AndroidServiceForegroundType.foregroundServiceTypeShortService,
+      "special_use": AndroidServiceForegroundType.foregroundServiceTypeSpecialUse,
+    };
+    final result = <AndroidServiceForegroundType>{};
+    for (final v in values) {
+      final type = map[v as String];
+      if (type == null) {
+        throw ArgumentError('invalid foreground_service_type: $v');
+      }
+      result.add(type);
+    }
+    return result;
+  }
+
+  NotificationDetails _buildNotificationDetails({
+    required String channelId,
+    required String channelName,
+    required String channelDescription,
+    required Importance importance,
+    required Priority priority,
+    required bool playSound,
+    required bool enableVibration,
+    required List<AndroidNotificationAction> actions,
+    StyleInformation? styleInformation,
+    bool showProgress = false,
+    int maxProgress = 0,
+    int progress = 0,
+    bool indeterminate = false,
+    String? groupKey,
+    bool setAsGroupSummary = false,
+    GroupAlertBehavior groupAlertBehavior = GroupAlertBehavior.all,
+    String? icon,
+    AndroidBitmap<Object>? largeIcon,
+    Color? color,
+    bool colorized = false,
+    String? sound,
+    bool ongoing = false,
+    bool autoCancel = true,
+    bool silent = false,
+    bool onlyAlertOnce = false,
+    NotificationVisibility? visibility,
+    String? subText,
+    bool channelBypassDnd = false,
+    Int64List? vibrationPattern,
+    int? timeoutAfter,
+    AndroidNotificationCategory? category,
+    bool fullScreenIntent = false,
+    int? when,
+    bool showWhen = true,
+    bool usesChronometer = false,
+    bool chronometerCountDown = false,
+  }) {
+    final androidDetails = AndroidNotificationDetails(
+      channelId,
+      channelName,
+      channelDescription: channelDescription,
+      importance: importance,
+      priority: priority,
+      playSound: playSound,
+      enableVibration: enableVibration,
+      actions: actions,
+      styleInformation: styleInformation,
+      showProgress: showProgress,
+      maxProgress: maxProgress,
+      progress: progress,
+      indeterminate: indeterminate,
+      groupKey: groupKey,
+      setAsGroupSummary: setAsGroupSummary,
+      groupAlertBehavior: groupAlertBehavior,
+      icon: icon,
+      largeIcon: largeIcon,
+      color: color,
+      colorized: colorized,
+      sound: sound != null ? RawResourceAndroidNotificationSound(sound) : null,
+      ongoing: ongoing,
+      autoCancel: autoCancel,
+      silent: silent,
+      onlyAlertOnce: onlyAlertOnce,
+      visibility: visibility,
+      subText: subText,
+      channelBypassDnd: channelBypassDnd,
+      vibrationPattern: vibrationPattern,
+      timeoutAfter: timeoutAfter,
+      category: category,
+      fullScreenIntent: fullScreenIntent,
+      when: when,
+      showWhen: showWhen,
+      usesChronometer: usesChronometer,
+      chronometerCountDown: chronometerCountDown,
+    );
+    return NotificationDetails(android: androidDetails);
+  }
+
+  List<AndroidNotificationAction> _parseActions(List<dynamic> raw) {
+    return raw
+        .map((action) {
+          final data = Map<String, dynamic>.from(action as Map);
+          final inputs = ((data["inputs"] as List<dynamic>?) ?? [])
+              .map((input) {
+                final inputData = Map<String, dynamic>.from(input as Map);
+                return AndroidNotificationActionInput(
+                  label: inputData["label"] as String?,
+                  choices: ((inputData["choices"] as List<dynamic>?) ?? [])
+                      .cast<String>(),
+                  allowFreeFormInput:
+                      inputData["allow_free_form_input"] as bool? ?? true,
+                  allowedMimeTypes:
+                      (((inputData["allowed_mime_types"] as List<dynamic>?) ?? [])
+                              .cast<String>())
+                          .toSet(),
+                );
+              })
+              .toList();
+          return AndroidNotificationAction(
+            data["id"] as String,
+            data["title"] as String,
+            titleColor: _parseColor(data["title_color"] as String?),
+            icon: _parseActionIcon(
+                data["icon"] as String?,
+                data["icon_type"] as String? ?? "drawable_resource"),
+            contextual: data["contextual"] as bool? ?? false,
+            showsUserInterface: data["shows_user_interface"] as bool? ?? true,
+            allowGeneratedReplies:
+                data["allow_generated_replies"] as bool? ?? false,
+            inputs: inputs,
+            cancelNotification: data["cancel_notification"] as bool? ?? true,
+            semanticAction:
+                _parseSemanticAction(data["semantic_action"] as String? ?? "none"),
+            invisible: data["invisible"] as bool? ?? false,
+          );
+        })
+        .toList();
+  }
+
+  Future<dynamic> _onMethod(String name, dynamic args) async {
+    try {
+      switch (name) {
+        case "show_notification":
+          final a = Map<String, dynamic>.from(args as Map);
+          final importance = _parseImportance(a["importance"] as String);
+          final rawStyle = a["style"];
+          final styleInfo = _parseStyleInformation(
+              rawStyle != null ? Map<String, dynamic>.from(rawStyle as Map) : null);
+          await _showNotification(
+            a["id"] as int,
+            a["title"] as String,
+            a["body"] as String,
+            payload: a["payload"] as String,
+            channelId: a["channel_id"] as String,
+            channelName: a["channel_name"] as String,
+            channelDescription: a["channel_description"] as String,
+            importance: importance,
+            priority: _priorityFromImportance(importance),
+            playSound: a["play_sound"] as bool,
+            enableVibration: a["enable_vibration"] as bool,
+            actions: _parseActions(a["actions"] as List<dynamic>),
+            styleInformation: styleInfo,
+            showProgress: a["show_progress"] as bool? ?? false,
+            maxProgress: a["max_progress"] as int? ?? 0,
+            progress: a["progress"] as int? ?? 0,
+            indeterminate: a["indeterminate"] as bool? ?? false,
+            groupKey: a["group_key"] as String?,
+            setAsGroupSummary: a["set_as_group_summary"] as bool? ?? false,
+            groupAlertBehavior: _parseGroupAlertBehavior(
+                a["group_alert_behavior"] as String? ?? "all"),
+            icon: a["icon"] as String?,
+            largeIcon: _parseLargeIcon(
+                a["large_icon"] as String?,
+                a["large_icon_type"] as String? ?? "drawable_resource"),
+            color: _parseColor(a["color"] as String?),
+            colorized: a["colorized"] as bool? ?? false,
+            sound: a["sound"] as String?,
+            ongoing: a["ongoing"] as bool? ?? false,
+            autoCancel: a["auto_cancel"] as bool? ?? true,
+            silent: a["silent"] as bool? ?? false,
+            onlyAlertOnce: a["only_alert_once"] as bool? ?? false,
+            visibility: _parseVisibility(a["visibility"] as String?),
+            subText: a["sub_text"] as String?,
+            channelBypassDnd: a["channel_bypass_dnd"] as bool? ?? false,
+            vibrationPattern: a["vibration_pattern"] != null
+                ? Int64List.fromList(
+                    (a["vibration_pattern"] as List<dynamic>).cast<int>())
+                : null,
+            timeoutAfter: a["timeout_after"] as int?,
+            category: _parseCategory(a["category"] as String?),
+            fullScreenIntent: a["full_screen_intent"] as bool? ?? false,
+          );
+          return "ok";
+        case "schedule_notification":
+          final a = Map<String, dynamic>.from(args as Map);
+          final importance = _parseImportance(a["importance"] as String);
+          final rawStyle = a["style"];
+          final styleInfo = _parseStyleInformation(
+              rawStyle != null ? Map<String, dynamic>.from(rawStyle as Map) : null);
+          await _scheduleNotification(
+            a["id"] as int,
+            a["title"] as String,
+            a["body"] as String,
+            scheduledEpochMs: a["scheduled_epoch_ms"] as int,
+            timeZone: a["time_zone"] as String? ?? "UTC",
+            payload: a["payload"] as String,
+            channelId: a["channel_id"] as String,
+            channelName: a["channel_name"] as String,
+            channelDescription: a["channel_description"] as String,
+            importance: importance,
+            priority: _priorityFromImportance(importance),
+            playSound: a["play_sound"] as bool,
+            enableVibration: a["enable_vibration"] as bool,
+            actions: _parseActions(a["actions"] as List<dynamic>),
+            scheduleMode: _parseAndroidScheduleMode(
+                a["schedule_mode"] as String),
+            matchDateTimeComponents: _parseDateTimeComponents(
+                a["match_date_time_components"] as String?),
+            styleInformation: styleInfo,
+            showProgress: a["show_progress"] as bool? ?? false,
+            maxProgress: a["max_progress"] as int? ?? 0,
+            progress: a["progress"] as int? ?? 0,
+            indeterminate: a["indeterminate"] as bool? ?? false,
+            groupKey: a["group_key"] as String?,
+            setAsGroupSummary: a["set_as_group_summary"] as bool? ?? false,
+            groupAlertBehavior: _parseGroupAlertBehavior(
+                a["group_alert_behavior"] as String? ?? "all"),
+            icon: a["icon"] as String?,
+            largeIcon: _parseLargeIcon(
+                a["large_icon"] as String?,
+                a["large_icon_type"] as String? ?? "drawable_resource"),
+            color: _parseColor(a["color"] as String?),
+            colorized: a["colorized"] as bool? ?? false,
+            sound: a["sound"] as String?,
+            ongoing: a["ongoing"] as bool? ?? false,
+            autoCancel: a["auto_cancel"] as bool? ?? true,
+            silent: a["silent"] as bool? ?? false,
+            onlyAlertOnce: a["only_alert_once"] as bool? ?? false,
+            visibility: _parseVisibility(a["visibility"] as String?),
+            subText: a["sub_text"] as String?,
+            channelBypassDnd: a["channel_bypass_dnd"] as bool? ?? false,
+            vibrationPattern: a["vibration_pattern"] != null
+                ? Int64List.fromList(
+                    (a["vibration_pattern"] as List<dynamic>).cast<int>())
+                : null,
+            timeoutAfter: a["timeout_after"] as int?,
+            category: _parseCategory(a["category"] as String?),
+            fullScreenIntent: a["full_screen_intent"] as bool? ?? false,
+          );
+          return "ok";
+        case "periodically_show":
+          await _ensureInitialized();
+          final a = Map<String, dynamic>.from(args as Map);
+          final importance = _parseImportance(a["importance"] as String);
+          final rawStyle = a["style"];
+          final styleInfo = _parseStyleInformation(
+              rawStyle != null ? Map<String, dynamic>.from(rawStyle as Map) : null);
+          final details = _buildNotificationDetails(
+            channelId: a["channel_id"] as String,
+            channelName: a["channel_name"] as String,
+            channelDescription: a["channel_description"] as String,
+            importance: importance,
+            priority: _priorityFromImportance(importance),
+            playSound: a["play_sound"] as bool,
+            enableVibration: a["enable_vibration"] as bool,
+            actions: _parseActions(a["actions"] as List<dynamic>),
+            styleInformation: styleInfo,
+            showProgress: a["show_progress"] as bool? ?? false,
+            maxProgress: a["max_progress"] as int? ?? 0,
+            progress: a["progress"] as int? ?? 0,
+            indeterminate: a["indeterminate"] as bool? ?? false,
+            groupKey: a["group_key"] as String?,
+            setAsGroupSummary: a["set_as_group_summary"] as bool? ?? false,
+            groupAlertBehavior: _parseGroupAlertBehavior(
+                a["group_alert_behavior"] as String? ?? "all"),
+            icon: a["icon"] as String?,
+            largeIcon: _parseLargeIcon(
+                a["large_icon"] as String?,
+                a["large_icon_type"] as String? ?? "drawable_resource"),
+            color: _parseColor(a["color"] as String?),
+            colorized: a["colorized"] as bool? ?? false,
+            sound: a["sound"] as String?,
+            ongoing: a["ongoing"] as bool? ?? false,
+            autoCancel: a["auto_cancel"] as bool? ?? true,
+            silent: a["silent"] as bool? ?? false,
+            onlyAlertOnce: a["only_alert_once"] as bool? ?? false,
+            visibility: _parseVisibility(a["visibility"] as String?),
+            subText: a["sub_text"] as String?,
+            channelBypassDnd: a["channel_bypass_dnd"] as bool? ?? false,
+            vibrationPattern: a["vibration_pattern"] != null
+                ? Int64List.fromList(
+                    (a["vibration_pattern"] as List<dynamic>).cast<int>())
+                : null,
+            timeoutAfter: a["timeout_after"] as int?,
+            category: _parseCategory(a["category"] as String?),
+          );
+          await _plugin.periodicallyShow(
+            id: a["id"] as int,
+            title: a["title"] as String,
+            body: a["body"] as String,
+            notificationDetails: details,
+            repeatInterval: _parseRepeatInterval(a["repeat_interval"] as String),
+            androidScheduleMode: _parseAndroidScheduleMode(
+                a["schedule_mode"] as String? ?? "inexact_allow_while_idle"),
+            payload: a["payload"] as String,
+          );
+          return "ok";
+        case "periodically_show_with_duration":
+          await _ensureInitialized();
+          final a = Map<String, dynamic>.from(args as Map);
+          final importance = _parseImportance(a["importance"] as String);
+          final rawStyle = a["style"];
+          final styleInfo = _parseStyleInformation(
+              rawStyle != null ? Map<String, dynamic>.from(rawStyle as Map) : null);
+          final details = _buildNotificationDetails(
+            channelId: a["channel_id"] as String,
+            channelName: a["channel_name"] as String,
+            channelDescription: a["channel_description"] as String,
+            importance: importance,
+            priority: _priorityFromImportance(importance),
+            playSound: a["play_sound"] as bool,
+            enableVibration: a["enable_vibration"] as bool,
+            actions: _parseActions(a["actions"] as List<dynamic>),
+            styleInformation: styleInfo,
+            showProgress: a["show_progress"] as bool? ?? false,
+            maxProgress: a["max_progress"] as int? ?? 0,
+            progress: a["progress"] as int? ?? 0,
+            indeterminate: a["indeterminate"] as bool? ?? false,
+            groupKey: a["group_key"] as String?,
+            setAsGroupSummary: a["set_as_group_summary"] as bool? ?? false,
+            groupAlertBehavior: _parseGroupAlertBehavior(
+                a["group_alert_behavior"] as String? ?? "all"),
+            icon: a["icon"] as String?,
+            largeIcon: _parseLargeIcon(
+                a["large_icon"] as String?,
+                a["large_icon_type"] as String? ?? "drawable_resource"),
+            color: _parseColor(a["color"] as String?),
+            colorized: a["colorized"] as bool? ?? false,
+            sound: a["sound"] as String?,
+            ongoing: a["ongoing"] as bool? ?? false,
+            autoCancel: a["auto_cancel"] as bool? ?? true,
+            silent: a["silent"] as bool? ?? false,
+            onlyAlertOnce: a["only_alert_once"] as bool? ?? false,
+            visibility: _parseVisibility(a["visibility"] as String?),
+            subText: a["sub_text"] as String?,
+            channelBypassDnd: a["channel_bypass_dnd"] as bool? ?? false,
+            vibrationPattern: a["vibration_pattern"] != null
+                ? Int64List.fromList(
+                    (a["vibration_pattern"] as List<dynamic>).cast<int>())
+                : null,
+            timeoutAfter: a["timeout_after"] as int?,
+            category: _parseCategory(a["category"] as String?),
+          );
+          await _plugin.periodicallyShowWithDuration(
+            id: a["id"] as int,
+            title: a["title"] as String,
+            body: a["body"] as String,
+            notificationDetails: details,
+            repeatDurationInterval: Duration(milliseconds: a["duration_ms"] as int),
+            androidScheduleMode: _parseAndroidScheduleMode(
+                a["schedule_mode"] as String? ?? "inexact_allow_while_idle"),
+            payload: a["payload"] as String,
+          );
+          return "ok";
+        case "start_foreground_service":
+          await _ensureInitialized();
+          final a = Map<String, dynamic>.from(args as Map);
+          final importance = _parseImportance(a["importance"] as String);
+          final rawStyle = a["style"];
+          final styleInfo = _parseStyleInformation(
+              rawStyle != null ? Map<String, dynamic>.from(rawStyle as Map) : null);
+          final details = _buildNotificationDetails(
+            when: a["when"] as int?,
+            showWhen: a["show_when"] as bool? ?? true,
+            usesChronometer: a["uses_chronometer"] as bool? ?? false,
+            chronometerCountDown: a["chronometer_count_down"] as bool? ?? false,
+            channelId: a["channel_id"] as String,
+            channelName: a["channel_name"] as String,
+            channelDescription: a["channel_description"] as String,
+            importance: importance,
+            priority: _priorityFromImportance(importance),
+            playSound: a["play_sound"] as bool,
+            enableVibration: a["enable_vibration"] as bool,
+            actions: _parseActions(a["actions"] as List<dynamic>),
+            styleInformation: styleInfo,
+            showProgress: a["show_progress"] as bool? ?? false,
+            maxProgress: a["max_progress"] as int? ?? 0,
+            progress: a["progress"] as int? ?? 0,
+            indeterminate: a["indeterminate"] as bool? ?? false,
+            groupKey: a["group_key"] as String?,
+            setAsGroupSummary: a["set_as_group_summary"] as bool? ?? false,
+            groupAlertBehavior: _parseGroupAlertBehavior(
+                a["group_alert_behavior"] as String? ?? "all"),
+            icon: a["icon"] as String?,
+            largeIcon: _parseLargeIcon(
+                a["large_icon"] as String?,
+                a["large_icon_type"] as String? ?? "drawable_resource"),
+            color: _parseColor(a["color"] as String?),
+            colorized: a["colorized"] as bool? ?? false,
+            sound: a["sound"] as String?,
+            ongoing: a["ongoing"] as bool? ?? false,
+            autoCancel: a["auto_cancel"] as bool? ?? true,
+            silent: a["silent"] as bool? ?? false,
+            onlyAlertOnce: a["only_alert_once"] as bool? ?? false,
+            visibility: _parseVisibility(a["visibility"] as String?),
+            subText: a["sub_text"] as String?,
+            channelBypassDnd: a["channel_bypass_dnd"] as bool? ?? false,
+            vibrationPattern: a["vibration_pattern"] != null
+                ? Int64List.fromList(
+                    (a["vibration_pattern"] as List<dynamic>).cast<int>())
+                : null,
+            timeoutAfter: a["timeout_after"] as int?,
+            category: _parseCategory(a["category"] as String?),
+          );
+          final android = _plugin.resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin>();
+          if (android == null) throw Exception('Android platform not available');
+          await android.startForegroundService(
+            id: a["id"] as int,
+            title: a["title"] as String,
+            body: a["body"] as String,
+            notificationDetails: details.android,
+            payload: a["payload"] as String,
+            startType: _parseServiceStartType(a["start_type"] as String),
+            foregroundServiceTypes: _parseForegroundServiceTypes(
+                a["foreground_service_types"] as List<dynamic>?),
+          );
+          return "ok";
+        case "stop_foreground_service":
+          await _ensureInitialized();
+          final android = _plugin.resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin>();
+          if (android == null) throw Exception('Android platform not available');
+          await android.stopForegroundService();
+          return "ok";
+        case "get_active_notifications":
+          await _ensureInitialized();
+          final active = await _plugin.getActiveNotifications();
+          final list = active.map((n) => {
+            "id": n.id,
+            "title": n.title ?? "",
+            "body": n.body ?? "",
+            "channel_id": n.channelId ?? "",
+            "payload": n.payload ?? "",
+          }).toList();
+          return jsonEncode(list);
+        case "get_notification_app_launch_details":
+          await _ensureInitialized();
+          final details = await _plugin.getNotificationAppLaunchDetails();
+          final response = details?.notificationResponse;
+          return jsonEncode({
+            "did_notification_launch_app":
+                details?.didNotificationLaunchApp ?? false,
+            "notification_response":
+                response != null ? _notificationResponseToMap(response) : null,
+          });
+        case "get_pending_notifications":
+          await _ensureInitialized();
+          final pending = await _plugin.pendingNotificationRequests();
+          final list = pending.map((n) => {
+            "id": n.id,
+            "title": n.title ?? "",
+            "body": n.body ?? "",
+            "payload": n.payload ?? "",
+          }).toList();
+          return jsonEncode(list);
+        case "cancel":
+          await _ensureInitialized();
+          final a = Map<String, dynamic>.from(args as Map);
+          await _plugin.cancel(id: a["id"] as int);
+          return "ok";
+        case "cancel_all":
+          await _ensureInitialized();
+          await _plugin.cancelAll();
+          return "ok";
+        case "request_permissions":
+          final granted = await _requestPermissions();
+          return granted.toString();
+        case "request_exact_alarm_permission":
+          final granted = await _requestExactAlarmPermission();
+          return granted.toString();
+        case "are_notifications_enabled":
+          await _ensureInitialized();
+          final enabled = await _resolveAndroid().areNotificationsEnabled();
+          return (enabled ?? false).toString();
+        case "open_app_notification_settings":
+          await _ensureInitialized();
+          final opened = await _plugin.openAppNotificationSettings();
+          return (opened ?? false).toString();
+        case "can_schedule_exact_notifications":
+          await _ensureInitialized();
+          final can = await _resolveAndroid().canScheduleExactNotifications();
+          return (can ?? false).toString();
+        case "request_full_screen_intent_permission":
+          await _ensureInitialized();
+          final granted =
+              await _resolveAndroid().requestFullScreenIntentPermission();
+          return (granted ?? false).toString();
+        case "has_notification_policy_access":
+          await _ensureInitialized();
+          final has = await _resolveAndroid().hasNotificationPolicyAccess();
+          return (has ?? false).toString();
+        case "request_notification_policy_access":
+          await _ensureInitialized();
+          final access =
+              await _resolveAndroid().requestNotificationPolicyAccess();
+          return (access ?? false).toString();
+        case "create_notification_channel":
+          await _ensureInitialized();
+          final a = Map<String, dynamic>.from(args as Map);
+          await _resolveAndroid().createNotificationChannel(
+            AndroidNotificationChannel(
+              a["channel_id"] as String,
+              a["channel_name"] as String,
+              description: a["channel_description"] as String?,
+              groupId: a["group_id"] as String?,
+              importance: _parseImportance(a["importance"] as String? ?? "default"),
+              playSound: a["play_sound"] as bool? ?? true,
+              sound: a["sound"] != null
+                  ? RawResourceAndroidNotificationSound(a["sound"] as String)
+                  : null,
+              enableVibration: a["enable_vibration"] as bool? ?? true,
+              vibrationPattern: a["vibration_pattern"] != null
+                  ? Int64List.fromList(
+                      (a["vibration_pattern"] as List<dynamic>).cast<int>())
+                  : null,
+              showBadge: a["show_badge"] as bool? ?? true,
+              bypassDnd: a["channel_bypass_dnd"] as bool? ?? false,
+            ),
+          );
+          return "ok";
+        case "delete_notification_channel":
+          await _ensureInitialized();
+          final a = Map<String, dynamic>.from(args as Map);
+          await _resolveAndroid()
+              .deleteNotificationChannel(channelId: a["channel_id"] as String);
+          return "ok";
+        case "get_notification_channels":
+          await _ensureInitialized();
+          final channels =
+              await _resolveAndroid().getNotificationChannels() ?? [];
+          final list = channels
+              .map((c) => {
+                    "id": c.id,
+                    "name": c.name,
+                    "description": c.description ?? "",
+                    "importance": c.importance.value,
+                    "play_sound": c.playSound,
+                    "enable_vibration": c.enableVibration,
+                    "bypass_dnd": c.bypassDnd,
+                    "show_badge": c.showBadge,
+                  })
+              .toList();
+          return jsonEncode(list);
+        case "create_notification_channel_group":
+          await _ensureInitialized();
+          final a = Map<String, dynamic>.from(args as Map);
+          await _resolveAndroid().createNotificationChannelGroup(
+            AndroidNotificationChannelGroup(
+              a["group_id"] as String,
+              a["name"] as String,
+              description: a["description"] as String?,
+            ),
+          );
+          return "ok";
+        case "delete_notification_channel_group":
+          await _ensureInitialized();
+          final a = Map<String, dynamic>.from(args as Map);
+          await _resolveAndroid()
+              .deleteNotificationChannelGroup(groupId: a["group_id"] as String);
+          return "ok";
+      }
+      throw ArgumentError('unknown method: $name');
+    } catch (e) {
+      return "error:${e.runtimeType}: $e";
+    }
+  }
+
+  Future<void> _showNotification(
+    int id,
+    String title,
+    String body, {
+    required String payload,
+    required String channelId,
+    required String channelName,
+    required String channelDescription,
+    required Importance importance,
+    required Priority priority,
+    required bool playSound,
+    required bool enableVibration,
+    required List<AndroidNotificationAction> actions,
+    StyleInformation? styleInformation,
+    bool showProgress = false,
+    int maxProgress = 0,
+    int progress = 0,
+    bool indeterminate = false,
+    String? groupKey,
+    bool setAsGroupSummary = false,
+    GroupAlertBehavior groupAlertBehavior = GroupAlertBehavior.all,
+    String? icon,
+    AndroidBitmap<Object>? largeIcon,
+    Color? color,
+    bool colorized = false,
+    String? sound,
+    bool ongoing = false,
+    bool autoCancel = true,
+    bool silent = false,
+    bool onlyAlertOnce = false,
+    NotificationVisibility? visibility,
+    String? subText,
+    bool channelBypassDnd = false,
+    Int64List? vibrationPattern,
+    int? timeoutAfter,
+    AndroidNotificationCategory? category,
+    bool fullScreenIntent = false,
+  }) async {
+    final initialized = await _ensureInitialized();
+    if (!initialized) {
+      throw Exception('Notification plugin failed to initialize');
+    }
+    _lastShowTime = DateTime.now();
+
+    final details = _buildNotificationDetails(
+      channelId: channelId,
+      channelName: channelName,
+      channelDescription: channelDescription,
+      importance: importance,
+      priority: priority,
+      playSound: playSound,
+      enableVibration: enableVibration,
+      actions: actions,
+      styleInformation: styleInformation,
+      showProgress: showProgress,
+      maxProgress: maxProgress,
+      progress: progress,
+      indeterminate: indeterminate,
+      groupKey: groupKey,
+      setAsGroupSummary: setAsGroupSummary,
+      groupAlertBehavior: groupAlertBehavior,
+      icon: icon,
+      largeIcon: largeIcon,
+      color: color,
+      colorized: colorized,
+      sound: sound,
+      ongoing: ongoing,
+      autoCancel: autoCancel,
+      silent: silent,
+      onlyAlertOnce: onlyAlertOnce,
+      visibility: visibility,
+      subText: subText,
+      channelBypassDnd: channelBypassDnd,
+      vibrationPattern: vibrationPattern,
+      timeoutAfter: timeoutAfter,
+      category: category,
+      fullScreenIntent: fullScreenIntent,
+    );
+
+    await _plugin.show(id: id, title: title, body: body, notificationDetails: details, payload: payload);
+  }
+
+  Future<void> _scheduleNotification(
+    int id,
+    String title,
+    String body, {
+    required int scheduledEpochMs,
+    required String timeZone,
+    required String payload,
+    required String channelId,
+    required String channelName,
+    required String channelDescription,
+    required Importance importance,
+    required Priority priority,
+    required bool playSound,
+    required bool enableVibration,
+    required List<AndroidNotificationAction> actions,
+    required AndroidScheduleMode scheduleMode,
+    required DateTimeComponents? matchDateTimeComponents,
+    StyleInformation? styleInformation,
+    bool showProgress = false,
+    int maxProgress = 0,
+    int progress = 0,
+    bool indeterminate = false,
+    String? groupKey,
+    bool setAsGroupSummary = false,
+    GroupAlertBehavior groupAlertBehavior = GroupAlertBehavior.all,
+    String? icon,
+    AndroidBitmap<Object>? largeIcon,
+    Color? color,
+    bool colorized = false,
+    String? sound,
+    bool ongoing = false,
+    bool autoCancel = true,
+    bool silent = false,
+    bool onlyAlertOnce = false,
+    NotificationVisibility? visibility,
+    String? subText,
+    bool channelBypassDnd = false,
+    Int64List? vibrationPattern,
+    int? timeoutAfter,
+    AndroidNotificationCategory? category,
+    bool fullScreenIntent = false,
+  }) async {
+    final initialized = await _ensureInitialized();
+    if (!initialized) {
+      throw Exception('Notification plugin failed to initialize');
+    }
+
+    final scheduledDate = tz.TZDateTime.from(
+      DateTime.fromMillisecondsSinceEpoch(scheduledEpochMs, isUtc: true),
+      // One-offs retain their exact instant, including the repeated DST hour.
+      matchDateTimeComponents == null ? tz.UTC : tz.getLocation(timeZone),
+    );
+
+    final details = _buildNotificationDetails(
+      channelId: channelId,
+      channelName: channelName,
+      channelDescription: channelDescription,
+      importance: importance,
+      priority: priority,
+      playSound: playSound,
+      enableVibration: enableVibration,
+      actions: actions,
+      styleInformation: styleInformation,
+      showProgress: showProgress,
+      maxProgress: maxProgress,
+      progress: progress,
+      indeterminate: indeterminate,
+      groupKey: groupKey,
+      setAsGroupSummary: setAsGroupSummary,
+      groupAlertBehavior: groupAlertBehavior,
+      icon: icon,
+      largeIcon: largeIcon,
+      color: color,
+      colorized: colorized,
+      sound: sound,
+      ongoing: ongoing,
+      autoCancel: autoCancel,
+      silent: silent,
+      onlyAlertOnce: onlyAlertOnce,
+      visibility: visibility,
+      subText: subText,
+      channelBypassDnd: channelBypassDnd,
+      vibrationPattern: vibrationPattern,
+      timeoutAfter: timeoutAfter,
+      category: category,
+      fullScreenIntent: fullScreenIntent,
+    );
+
+    await _plugin.zonedSchedule(
+      id: id,
+      title: title,
+      body: body,
+      scheduledDate: scheduledDate,
+      notificationDetails: details,
+      androidScheduleMode: scheduleMode,
+      payload: payload,
+      matchDateTimeComponents: matchDateTimeComponents,
+    );
+  }
+
+  AndroidFlutterLocalNotificationsPlugin _resolveAndroid() {
+    final android = _plugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    if (android == null) {
+      throw Exception('Android platform not available');
+    }
+    return android;
+  }
+
+  Future<bool> _requestPermissions() async {
+    await _ensureInitialized();
+
+    final android = _plugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    if (android == null) return false;
+
+    final granted = await android.requestNotificationsPermission();
+    return granted ?? false;
+  }
+
+  Future<bool> _requestExactAlarmPermission() async {
+    await _ensureInitialized();
+
+    final android = _plugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    if (android == null) return false;
+
+    final granted = await android.requestExactAlarmsPermission();
+    return granted ?? false;
+  }
+}

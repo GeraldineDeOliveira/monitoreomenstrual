@@ -9,7 +9,7 @@ def registrar_Emociones(fecha,emocion):
     miConexion.commit()
     miConexion.close()
     return "Emoción registrada correctamente."
-
+#en practicamente todos los modulos se usa la base de datos
 def consultar_Emociones(fecha):
     miConexion=sqlite3.connect("monitoreo.sqlite3")
     miCursor=miConexion.cursor()

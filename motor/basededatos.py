@@ -2,9 +2,9 @@ import sqlite3 #importo la libreria
 miConexion=sqlite3.connect("monitoreo.sqlite3")
 print(miConexion)
 
-miCursor=miConexion.cursor()
+miCursor=miConexion.cursor() #con eso de abajo se crean las tablas usando el sql o php no recuerdo cual era, pero nos lo enseñaron en cientifica
 sqlejecutar= '''
-    CREATE TABLE IF NOT EXISTS periodos(
+    CREATE TABLE IF NOT EXISTS periodos(   
         ID INTEGER PRIMARY KEY AUTOINCREMENT,
         fecha_de_inicio TEXT NOT NULL,
         duracion INTEGER
@@ -15,7 +15,7 @@ sqlejecutar='''
     CREATE TABLE IF NOT EXISTS emociones(
             ID INTEGER PRIMARY KEY AUTOINCREMENT,
             fecha TEXT NOT NULL,
-            emocion INTEGER
+            emocion TEXT
     )
 '''
 miCursor.execute(sqlejecutar)
@@ -23,7 +23,7 @@ sqlejecutar='''
     CREATE TABLE IF NOT EXISTS flujo(
         ID INTEGER PRIMARY KEY AUTOINCREMENT,
         fecha TEXT NOT NULL,
-        tipo INTEGER
+        tipo TEXT
     )
 '''
 miCursor.execute(sqlejecutar)
@@ -37,5 +37,5 @@ sqlejecutar='''
 '''
 miCursor.execute(sqlejecutar)
 
-print("Tablas creadas :3")
+print("Tablas creadas :3") #esto avisa si las tablas se crearon
 

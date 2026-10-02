@@ -31,3 +31,4 @@ def registrar_dolor(fecha,nivel):
             print("3-Dolor moderado")
             print("4-Dolor fuerte")
             print("5-Dolor insoportable")
+            #deberia poner mas numeros y tipos de dolor? talves lo agrege como mejora

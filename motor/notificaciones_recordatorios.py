@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from predicciones import predecir #voy a usar el modilo de predicciones para las notificaciones
+from motor.predicciones import predecir #voy a usar el modilo de predicciones para las notificaciones
 
 def dias_faltantes():
     proximo,periodo=predecir()
@@ -23,3 +23,4 @@ def verificar():
         print("si no empezo, puede ser normal,pero si tienes dudas cpnsulta a tu medico")
     else:
         print(f"Te aviso cuadno falten 3 dias para tu periodo. aun faltan {faltan}")
+#esta parte te dice cuanto alta para el periodo,si falta mucho te va a decir que te faltan x dias, y asi

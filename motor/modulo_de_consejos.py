@@ -2,6 +2,7 @@
 #- Organización Mundial de la Salud (OMS). Guía de higiene menstrual.
 #- UNICEF. (2020). Guía de higiene menstrual para adolescentes: Educación y empoderamiento.
 #- De Sanctis, V., et al. (2019). Primary dysmenorrhea in adolescents. Acta Bio-Medica.
+#no se si era tan necesario poner eso,ya que la informacion es de conocimiento publico,opero por si acaso lo pongo
 def que_es():
     return ("La menstruación es el sangrado mensual que ocurre cuando tu cuerpo elimina "
             "el revestimiento del útero que no se usó. Es un proceso natural y normal "
@@ -56,3 +57,4 @@ def mostrar_consejos(nivel):
     print(origen())
     print("")
     print(consejos_dolor(nivel))
+#esto muestra una lista con toda la informacion
