@@ -138,6 +138,9 @@ def main(page: ft.Page):
                 body="Tu período se acerca, faltan 3 días.",
                 scheduled_time=fecha_aviso,
             )
+    def salir(e=None):
+        page.window.close()  # cierra la ventana
+        page.window.destroy()  # fuerza el cierre del proceso (solo desktop)
 
     #lam primera pantalla que va a mostrar el periodo estimado, registrar emociones y dolor
     def mostrar_inicio(e=None):
@@ -167,7 +170,8 @@ def main(page: ft.Page):
                     ),
                     boton_app_icono("+ Registrar Síntomas o Dolor", "icono_dolor.png", mostrar_dolor),
                     boton_app_icono("Registrar inicio de período", "registrar_ciclo.png", mostrar_periodo),
-                    ft.TextButton("Salir", on_click=lambda e: page.window.close()),
+                    
+
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 spacing=12,
