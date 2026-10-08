@@ -23,9 +23,8 @@ jobs:
             libgstreamer-plugins-base1.0-dev libgraphene-1.0-0
 
       - name: Install Flet
-        run: |
-          pip install flet-cli
-          pip install jni==1.1.0
+        run: pip install flet-cli
+
 
       - name: Install Flutter
         run: |
