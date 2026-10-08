@@ -16,12 +16,17 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev mesa-utils ninja-build libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev libgraphene-1.0-0
+
       - name: Install Flet
         run: pip install flet-cli
-        
+
       - name: Build APK
         run: flet build apk --yes
-
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
