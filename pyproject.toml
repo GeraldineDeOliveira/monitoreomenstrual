@@ -1,7 +1,8 @@
 [project]
 dependencies = [
-    "flet>=0.82.0",
-    "flet-android-notifications==0.12.0",
+    "flet>=1.0.0",
+    "flet-android-notifications",
+    "plyer",
 ]
 
 [tool.flet.flutter.pubspec.dependency_overrides]
