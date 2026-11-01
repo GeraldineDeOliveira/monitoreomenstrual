@@ -1,5 +1,12 @@
 [project]
-dependencies = ["flet", "flet-android-notifications"]
+dependencies = [
+    "flet>=1.0.0",
+    "flet-android-notifications",
+    "plyer",
+]
+
+[tool.flet.flutter.pubspec.dependency_overrides]
+jni = "1.1.0"
 
 [tool.flet.android.permission]
 "android.permission.POST_NOTIFICATIONS" = true
